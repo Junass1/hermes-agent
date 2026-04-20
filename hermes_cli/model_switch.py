@@ -1119,6 +1119,7 @@ def list_authenticated_providers(
                 continue
 
             display_name = (entry.get("name") or "").strip()
+            provider_key = str(entry.get("provider_key", "") or "").strip()
             api_url = (
                 entry.get("base_url", "")
                 or entry.get("url", "")
@@ -1128,12 +1129,13 @@ def list_authenticated_providers(
             if not display_name or not api_url:
                 continue
 
-            slug = custom_provider_slug(display_name)
+            slug = custom_provider_slug(display_name, provider_key=provider_key)
             if slug not in groups:
                 groups[slug] = {
                     "name": display_name,
                     "api_url": api_url,
                     "models": [],
+                    "provider_key": provider_key,
                 }
             # The singular ``model:`` field only holds the currently
             # active model. Hermes's own writer (main.py::_save_custom_provider)
@@ -1170,10 +1172,17 @@ def list_authenticated_providers(
             )
             if _pair_key[0] and _pair_key[1] and _pair_key in _section3_emitted_pairs:
                 continue
+            current_keys = {slug.lower()}
+            display_slug = custom_provider_slug(grp["name"]).lower()
+            current_keys.add(display_slug)
+            provider_key = str(grp.get("provider_key", "") or "").strip().lower()
+            if provider_key:
+                current_keys.add(provider_key)
+                current_keys.add(f"custom:{provider_key}")
             results.append({
                 "slug": slug,
                 "name": grp["name"],
-                "is_current": slug == current_provider,
+                "is_current": current_provider.lower() in current_keys,
                 "is_user_defined": True,
                 "models": grp["models"],
                 "total_models": len(grp["models"]),

@@ -481,13 +481,18 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
     )
 
 
-def custom_provider_slug(display_name: str) -> str:
-    """Build a canonical slug for a custom_providers entry.
+def custom_provider_slug(display_name: str, provider_key: str = "") -> str:
+    """Build the selector key for a custom_providers entry.
 
-    Matches the convention used by runtime_provider and credential_pool
-    (``custom:<normalized-name>``).  Centralised here so all call-sites
-    produce identical slugs.
+    Prefer ``provider_key`` when one is configured and it does not collide with
+    a built-in provider alias. Otherwise fall back to the historical
+    ``custom:<normalized-name>`` slug.
     """
+    provider_key = provider_key.strip().lower()
+    if provider_key:
+        canonical = normalize_provider(provider_key)
+        if get_provider(canonical) is None:
+            return provider_key
     return "custom:" + display_name.strip().lower().replace(" ", "-")
 
 
@@ -508,6 +513,7 @@ def resolve_custom_provider(
             continue
 
         display_name = (entry.get("name") or "").strip()
+        provider_key = str(entry.get("provider_key", "") or "").strip()
         api_url = (
             entry.get("base_url", "")
             or entry.get("url", "")
@@ -517,8 +523,13 @@ def resolve_custom_provider(
         if not display_name or not api_url:
             continue
 
-        slug = custom_provider_slug(display_name)
-        if requested not in {display_name.lower(), slug}:
+        slug = custom_provider_slug(display_name, provider_key=provider_key)
+        requested_keys = {display_name.lower(), slug}
+        if provider_key:
+            provider_key_lower = provider_key.lower()
+            requested_keys.add(provider_key_lower)
+            requested_keys.add(f"custom:{provider_key_lower}")
+        if requested not in requested_keys:
             continue
 
         return ProviderDef(

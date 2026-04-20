@@ -253,3 +253,75 @@ def test_list_dedupes_dict_model_matching_singular_default(monkeypatch):
     ds_rows = [p for p in providers if p["name"] == "DeepSeek"]
     assert ds_rows[0]["models"].count("deepseek-chat") == 1
     assert ds_rows[0]["models"] == ["deepseek-chat", "deepseek-reasoner"]
+
+
+def test_list_keeps_provider_key_custom_endpoints_separate(monkeypatch):
+    """Legacy custom_providers entries with distinct provider_key values must
+    not be merged just because they share the same display name.
+
+    Regression: the /model picker grouped by display-name slug only, so two
+    different endpoints named "Acme Gateway" collapsed into one row and the
+    first row's base_url was reused for both models.
+    """
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+
+    providers = list_authenticated_providers(
+        current_provider="proxy-b",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Acme Gateway",
+                "provider_key": "proxy-a",
+                "base_url": "https://a.example.com/v1",
+                "model": "model-a",
+            },
+            {
+                "name": "Acme Gateway",
+                "provider_key": "proxy-b",
+                "base_url": "https://b.example.com/v1",
+                "model": "model-b",
+            },
+        ],
+        max_models=50,
+    )
+
+    acme_rows = [p for p in providers if p["name"] == "Acme Gateway"]
+    assert len(acme_rows) == 2
+    assert [p["slug"] for p in acme_rows] == ["proxy-b", "proxy-a"]
+    assert acme_rows[0]["api_url"] == "https://b.example.com/v1"
+    assert acme_rows[0]["models"] == ["model-b"]
+    assert acme_rows[0]["is_current"] is True
+    assert acme_rows[1]["api_url"] == "https://a.example.com/v1"
+    assert acme_rows[1]["models"] == ["model-a"]
+
+
+def test_resolve_provider_full_accepts_custom_provider_key():
+    """Explicit /model --provider should honor legacy provider_key selectors.
+
+    The interactive ``hermes model`` flow already uses provider_key when it is
+    present, so the shared slash-command path must resolve that same key.
+    """
+    resolved = resolve_provider_full(
+        "proxy-b",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Acme Gateway",
+                "provider_key": "proxy-a",
+                "base_url": "https://a.example.com/v1",
+                "model": "model-a",
+            },
+            {
+                "name": "Acme Gateway",
+                "provider_key": "proxy-b",
+                "base_url": "https://b.example.com/v1",
+                "model": "model-b",
+            },
+        ],
+    )
+
+    assert resolved is not None
+    assert resolved.id == "proxy-b"
+    assert resolved.name == "Acme Gateway"
+    assert resolved.base_url == "https://b.example.com/v1"
