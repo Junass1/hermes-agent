@@ -183,6 +183,25 @@ class TestPersistence:
         assert len(messages) == 1
         assert messages[0]["content"] == "test"
 
+    def test_save_session_preserves_existing_messages_on_append_failure(self, manager):
+        state = manager.create_session()
+        state.history.append({"role": "user", "content": "original"})
+        manager.save_session(state.session_id)
+
+        state.history = [
+            {"role": "user", "content": "replacement"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"bad": object()}],
+            },
+        ]
+        manager.save_session(state.session_id)
+
+        db = manager._get_db()
+        messages = db.get_messages_as_conversation(state.session_id)
+        assert messages == [{"role": "user", "content": "original"}]
+
     def test_remove_session_deletes_from_db(self, manager):
         state = manager.create_session()
         db = manager._get_db()

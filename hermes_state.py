@@ -986,6 +986,67 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        """Atomically replace all messages for a session.
+
+        Used by ACP session persistence, which rewrites the in-memory history.
+        Serialization happens before the write transaction so malformed input
+        cannot clear the previously persisted conversation.
+        """
+        rows = []
+        tool_call_count = 0
+        timestamp = time.time()
+
+        for index, msg in enumerate(messages):
+            tool_calls = msg.get("tool_calls")
+            reasoning_details = msg.get("reasoning_details")
+            codex_reasoning_items = msg.get("codex_reasoning_items")
+            tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+            reasoning_details_json = (
+                json.dumps(reasoning_details) if reasoning_details else None
+            )
+            codex_items_json = (
+                json.dumps(codex_reasoning_items) if codex_reasoning_items else None
+            )
+
+            if tool_calls is not None:
+                tool_call_count += len(tool_calls) if isinstance(tool_calls, list) else 1
+
+            rows.append(
+                (
+                    session_id,
+                    msg.get("role", "user"),
+                    msg.get("content"),
+                    msg.get("tool_call_id"),
+                    tool_calls_json,
+                    msg.get("tool_name") or msg.get("name"),
+                    timestamp + (index * 0.000001),
+                    msg.get("token_count"),
+                    msg.get("finish_reason"),
+                    msg.get("reasoning"),
+                    reasoning_details_json,
+                    codex_items_json,
+                )
+            )
+
+        def _do(conn):
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            if rows:
+                conn.executemany(
+                    """INSERT INTO messages (session_id, role, content, tool_call_id,
+                       tool_calls, tool_name, timestamp, token_count, finish_reason,
+                       reasoning, reasoning_details, codex_reasoning_items)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+            conn.execute(
+                """UPDATE sessions SET message_count = ?, tool_call_count = ?
+                   WHERE id = ?""",
+                (len(rows), tool_call_count, session_id),
+            )
+
+        self._execute_write(_do)
+
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""
         with self._lock:
