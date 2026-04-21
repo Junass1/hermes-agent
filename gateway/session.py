@@ -152,6 +152,7 @@ class SessionContext:
     source: SessionSource
     connected_platforms: List[Platform]
     home_channels: Dict[Platform, HomeChannel]
+    shared_multi_user_session: bool = False
     
     # Session metadata
     session_key: str = ""
@@ -166,6 +167,7 @@ class SessionContext:
             "home_channels": {
                 p.value: hc.to_dict() for p, hc in self.home_channels.items()
             },
+            "shared_multi_user_session": self.shared_multi_user_session,
             "session_key": self.session_key,
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -1216,7 +1218,7 @@ class SessionStore:
         return db_messages
 
 
-def build_session_context(
+def _build_session_context_legacy(
     source: SessionSource,
     config: GatewayConfig,
     session_entry: Optional[SessionEntry] = None
@@ -1247,3 +1249,184 @@ def build_session_context(
         context.updated_at = session_entry.updated_at
     
     return context
+
+
+def is_shared_multi_user_session(
+    source: SessionSource,
+    *,
+    group_sessions_per_user: bool = True,
+    thread_sessions_per_user: bool = False,
+) -> bool:
+    """Return True when a non-DM session is shared across participants."""
+    if source.chat_type == "dm":
+        return False
+    if source.thread_id:
+        return not thread_sessions_per_user
+    return not group_sessions_per_user
+
+
+def build_session_context(
+    source: SessionSource,
+    config: GatewayConfig,
+    session_entry: Optional["SessionEntry"] = None
+) -> SessionContext:
+    """
+    Build a full session context from a source and config.
+
+    This is used to inject context into the agent's system prompt.
+    """
+    connected = config.get_connected_platforms()
+
+    home_channels = {}
+    for platform in connected:
+        home = config.get_home_channel(platform)
+        if home:
+            home_channels[platform] = home
+
+    context = SessionContext(
+        source=source,
+        connected_platforms=connected,
+        home_channels=home_channels,
+        shared_multi_user_session=is_shared_multi_user_session(
+            source,
+            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+        ),
+    )
+
+    if session_entry:
+        context.session_key = session_entry.session_key
+        context.session_id = session_entry.session_id
+        context.created_at = session_entry.created_at
+        context.updated_at = session_entry.updated_at
+
+    return context
+
+
+def _build_session_context_prompt_legacy(
+    context: SessionContext,
+    *,
+    redact_pii: bool = False,
+) -> str:
+    """
+    Build the dynamic system prompt section that tells the agent about its context.
+
+    This is injected into the system prompt so the agent knows:
+    - Where messages are coming from
+    - What platforms are connected
+    - Where it can deliver scheduled task outputs
+
+    When *redact_pii* is True **and** the source platform is in
+    ``_PII_SAFE_PLATFORMS``, phone numbers are stripped and user/chat IDs
+    are replaced with deterministic hashes before being sent to the LLM.
+    Platforms like Discord are excluded because mentions need real IDs.
+    Routing still uses the original values (they stay in SessionSource).
+    """
+    redact_pii = redact_pii and context.source.platform in _PII_SAFE_PLATFORMS
+    lines = [
+        "## Current Session Context",
+        "",
+    ]
+
+    platform_name = context.source.platform.value.title()
+    if context.source.platform == Platform.LOCAL:
+        lines.append(f"**Source:** {platform_name} (the machine running this agent)")
+    else:
+        src = context.source
+        if redact_pii:
+            _uname = src.user_name or (
+                _hash_sender_id(src.user_id) if src.user_id else "user"
+            )
+            _cname = src.chat_name or _hash_chat_id(src.chat_id)
+            if src.chat_type == "dm":
+                desc = f"DM with {_uname}"
+            elif src.chat_type == "group":
+                desc = f"group: {_cname}"
+            elif src.chat_type == "channel":
+                desc = f"channel: {_cname}"
+            else:
+                desc = _cname
+        else:
+            desc = src.description
+        lines.append(f"**Source:** {platform_name} ({desc})")
+
+    if context.source.chat_topic:
+        lines.append(f"**Channel Topic:** {context.source.chat_topic}")
+
+    if context.shared_multi_user_session:
+        session_label = "Multi-user thread" if context.source.thread_id else "Multi-user session"
+        lines.append(
+            f"**Session type:** {session_label} \u2014 messages are prefixed "
+            "with [sender name]. Multiple users may participate."
+        )
+    elif context.source.user_name:
+        lines.append(f"**User:** {context.source.user_name}")
+    elif context.source.user_id:
+        uid = context.source.user_id
+        if redact_pii:
+            uid = _hash_sender_id(uid)
+        lines.append(f"**User ID:** {uid}")
+
+    if context.source.platform == Platform.SLACK:
+        lines.append("")
+        lines.append(
+            "**Platform notes:** You are running inside Slack. "
+            "You do NOT have access to Slack-specific APIs \u2014 you cannot search "
+            "channel history, pin/unpin messages, manage channels, or list users. "
+            "Do not promise to perform these actions. If the user asks, explain "
+            "that you can only read messages sent directly to you and respond."
+        )
+    elif context.source.platform == Platform.DISCORD:
+        lines.append("")
+        lines.append(
+            "**Platform notes:** You are running inside Discord. "
+            "You do NOT have access to Discord-specific APIs \u2014 you cannot search "
+            "channel history, pin messages, manage roles, or list server members. "
+            "Do not promise to perform these actions. If the user asks, explain "
+            "that you can only read messages sent directly to you and respond."
+        )
+
+    platforms_list = ["local (files on this machine)"]
+    for p in context.connected_platforms:
+        if p != Platform.LOCAL:
+            platforms_list.append(f"{p.value}: Connected \u2713")
+
+    lines.append(f"**Connected Platforms:** {', '.join(platforms_list)}")
+
+    if context.home_channels:
+        lines.append("")
+        lines.append("**Home Channels (default destinations):**")
+        for platform, home in context.home_channels.items():
+            hc_id = _hash_chat_id(home.chat_id) if redact_pii else home.chat_id
+            lines.append(f"  - {platform.value}: {home.name} (ID: {hc_id})")
+
+    lines.append("")
+    lines.append("**Delivery options for scheduled tasks:**")
+
+    from hermes_constants import display_hermes_home
+
+    if context.source.platform == Platform.LOCAL:
+        lines.append("- `\"origin\"` \u2192 Local output (saved to files)")
+    else:
+        _origin_label = context.source.chat_name or (
+            _hash_chat_id(context.source.chat_id) if redact_pii else context.source.chat_id
+        )
+        lines.append(f"- `\"origin\"` \u2192 Back to this chat ({_origin_label})")
+
+    lines.append(
+        f"- `\"local\"` \u2192 Save to local files only ({display_hermes_home()}/cron/output/)"
+    )
+
+    for platform, home in context.home_channels.items():
+        lines.append(f"- `\"{platform.value}\"` \u2192 Home channel ({home.name})")
+
+    lines.append("")
+    lines.append(
+        "*For explicit targeting, use `\"platform:chat_id\"` format if the user "
+        "provides a specific chat ID.*"
+    )
+
+    return "\n".join(lines)
+
+
+build_session_context_prompt = _build_session_context_prompt_legacy
