@@ -147,6 +147,14 @@ def _sweep_expired_pastes(now: Optional[float] = None) -> tuple[int, int]:
     return (deleted, len(remaining))
 
 
+def _best_effort_sweep_expired_pastes() -> None:
+    """Attempt pending-paste cleanup without letting /debug fail offline."""
+    try:
+        _sweep_expired_pastes()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Privacy / delete helpers
 # ---------------------------------------------------------------------------
@@ -448,6 +456,8 @@ def collect_debug_report(*, log_lines: int = 200, dump_text: str = "") -> str:
 
 def run_debug_share(args):
     """Collect debug report + full logs, upload each, print URLs."""
+    _best_effort_sweep_expired_pastes()
+
     log_lines = getattr(args, "lines", 200)
     expiry = getattr(args, "expire", 7)
     local_only = getattr(args, "local", False)
